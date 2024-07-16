@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>ReiTW's website</title>
+    <link rel="stylesheet" href="/fonts.css">
+    <link rel="stylesheet" href="/style.css">
+  </head>
+
+  <body>
+    <div class="content">
+      <header id="header">
+          <div>
+            <a id="main-title" href="/">ReiTW</a> 💻
+          </div>
+          <nav>
+            <a href="/blog">blog</a>
+            <a href="/bookmarks">bookmarks</a>
+            <a href="/about">about</a>
+          </nav>
+      </header>
+      
+      <div class="container">
+        
+
+<h1 class="blog-title">XDP packet capture in Rust with aya</h1>
+<p class="blog-subtitle">Published in <strong>2024-07-06</strong></p>
+<p class="blog-subtitle">
+
+    
+      <a href="https://reitw.fr/tags/rust/">#rust</a>
+    
+      <a href="https://reitw.fr/tags/aya/">#aya</a>
+    
+      <a href="https://reitw.fr/tags/xdp/">#xdp</a>
+    
+
+</p>
+
+<div class="blog-content">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "mainEntityOfPage": {
+    "@type": "WebPage",
+    "@id": "https://reitw.fr/blog/aya-xdp-pcap"
+  },
+  "headline": "XDP packet capture in Rust with aya",
+  "description": "Capture packets in a PCAP file before them getting dropped by XDP.",
+  "image": "https://reitw.fr/img/aya-xdp-pcap_img.jpeg",  
+  "author": {
+    "@type": "Person",
+    "name": "ReiTW",
+    "url": "https://reitw.fr/about"
+  },  
+  "publisher": {
+    "@type": "Organization",
+    "name": "",
+    "logo": {
+      "@type": "ImageObject",
+      "url": ""
+    }
+  },
+  "datePublished": "2024-07-06"
+}
+</script>
+<p>eXpress Data Path (XDP) can achieve exceptional performance in network-related applications like load balancers, firewalls, and anti-DDoS systems.</p>
+<p>When developing firewalls or anti-DDoS applications, it is crucial to monitor which packets our XDP program has dropped. This is useful for debugging and understanding the nature of attacks against our infrastructure.</p>
+<p>In most Linux distributions, common tools for packet capture are tcpdump (CLI) and Wireshark (GUI). These tools primarily rely on libpcap, which uses <code>AF_PACKET</code> (or <code>PF_PACKET</code>) to clone and capture raw packet data. By bypassing most of the networking stack, <code>AF_PACKET</code> offers better performance as it avoids processing packet data (e.g., parsing IP, TCP/UDP headers).</p>
+<p>However, XDP drops packets early in the networking stack, meaning tools like tcpdump cannot capture these dropped packets. Below is a simplified diagram of the network path of a packet in the kernel.</p>
+<img src="/img/network-stack-flow.svg">
+<p>To address this, we need to implement a packet capture program using XDP before the packet is dropped. By sending packets to userspace, we can log them into a pcap file. An event-driven map, such as a ring buffer (<code>BPF_MAP_TYPE_RINGBUF</code>), can facilitate this process.</p>
+<img src="/img/ring-buffer.svg" width="500px">
+<h2 id="kernel-space-code">Kernel-space code</h2>
+<p>First, we declare our ring buffer map in the eBPF code. In this example, the ring buffer map size is set to 16MB.
+A bigger size of the buffer better guarantees free space for new events. </p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span style="color:#bfbab0cc;">#</span><span>[</span><span style="color:#ffb454;">map</span><span>]
+</span><span style="color:#ff7733;">static </span><span style="color:#f29718;">RING_BUF</span><span style="color:#bfbab0cc;">:</span><span> RingBuf </span><span style="color:#f29668;">= </span><span>RingBuf</span><span style="color:#f29668;">::</span><span>with_byte_size(</span><span style="color:#f29718;">16_777_216</span><span style="color:#ff7733;">u32</span><span style="color:#bfbab0cc;">, </span><span style="color:#f29718;">0</span><span>)</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>Here is a working sample code to reserve a buffer in our ring buffer map and copy the raw packet into it. Note that this code might be inefficient because it reserves buffers of 1502 bytes even if the packet is significantly smaller.</p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span>    </span><span style="color:#ff7733;">const </span><span style="color:#f29718;">U16_SIZE</span><span style="color:#bfbab0cc;">: </span><span style="color:#ff7733;">usize </span><span style="color:#f29668;">= </span><span>mem</span><span style="color:#f29668;">::</span><span>size_of</span><span style="color:#f29668;">::</span><span>&lt;</span><span style="color:#ff7733;">u16</span><span>&gt;()</span><span style="color:#bfbab0cc;">;
+</span><span>    </span><span style="color:#ff7733;">const </span><span style="color:#f29718;">SIZE</span><span style="color:#bfbab0cc;">: </span><span style="color:#ff7733;">usize </span><span style="color:#f29668;">= </span><span style="color:#f29718;">U16_SIZE </span><span style="color:#f29668;">+ </span><span style="color:#f29718;">1500</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>    </span><span style="font-style:italic;color:#5c6773;">// reserve some space
+</span><span>    </span><span style="color:#ff7733;">match </span><span style="color:#f29718;">RING_BUF</span><span style="color:#f29668;">.</span><span>reserve</span><span style="color:#f29668;">::</span><span>&lt;[</span><span style="color:#ff7733;">u8</span><span style="color:#bfbab0cc;">; </span><span>SIZE]&gt;(</span><span style="color:#f29718;">0</span><span>) {
+</span><span>        </span><span style="font-style:italic;color:#39bae6;">Some</span><span>(</span><span style="color:#ff7733;">mut</span><span> event) </span><span style="color:#f29668;">=&gt; </span><span>{
+</span><span>            </span><span style="color:#ff7733;">let</span><span> len </span><span style="color:#f29668;">=</span><span> ctx</span><span style="color:#f29668;">.</span><span style="color:#f07178;">data_end</span><span>() </span><span style="color:#f29668;">-</span><span> ctx</span><span style="color:#f29668;">.</span><span style="color:#f07178;">data</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>            </span><span style="font-style:italic;color:#5c6773;">// We check if packet len is greater than our reserved buffer size
+</span><span>            </span><span style="color:#ff7733;">if </span><span>aya_ebpf</span><span style="color:#f29668;">::</span><span>check_bounds_signed(len </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">i64</span><span style="color:#bfbab0cc;">, </span><span style="color:#f29718;">1</span><span style="color:#bfbab0cc;">, </span><span style="color:#f29718;">1500</span><span>) </span><span style="color:#f29668;">== </span><span style="color:#f29718;">false </span><span>{
+</span><span>                event</span><span style="color:#f29668;">.</span><span style="color:#f07178;">discard</span><span>(</span><span style="color:#f29718;">0</span><span>)</span><span style="color:#bfbab0cc;">;
+</span><span>                </span><span style="color:#ff7733;">return </span><span style="font-style:italic;color:#39bae6;">Ok</span><span>(xdp_action</span><span style="color:#f29668;">::</span><span style="color:#f29718;">XDP_DROP</span><span>)</span><span style="color:#bfbab0cc;">; </span><span style="font-style:italic;color:#5c6773;">// action depends on what you plan to do
+</span><span>            }
+</span><span>
+</span><span>            </span><span style="color:#ff7733;">unsafe </span><span>{
+</span><span>                </span><span style="font-style:italic;color:#5c6773;">// we first save into the buffer the packet length.
+</span><span>                </span><span style="font-style:italic;color:#5c6773;">// Useful on userspace to retrieve the correct amount of bytes and not some bytes not part of the packet.
+</span><span>                ptr</span><span style="color:#f29668;">::</span><span>write_unaligned(event</span><span style="color:#f29668;">.</span><span style="color:#f07178;">as_mut_ptr</span><span>() </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">*mut </span><span style="color:#f29668;">_</span><span style="color:#bfbab0cc;">,</span><span> len </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">u16</span><span>)</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>                </span><span style="font-style:italic;color:#5c6773;">// We copy the entire content of the packet to the buffer (L2 to L7)
+</span><span>                </span><span style="color:#ff7733;">match </span><span>aya_ebpf</span><span style="color:#f29668;">::</span><span>helpers</span><span style="color:#f29668;">::</span><span>gen</span><span style="color:#f29668;">::</span><span>bpf_xdp_load_bytes(
+</span><span>                    ctx</span><span style="color:#f29668;">.</span><span>ctx</span><span style="color:#bfbab0cc;">,
+</span><span>                    </span><span style="color:#f29718;">0</span><span style="color:#bfbab0cc;">,
+</span><span>                    event</span><span style="color:#f29668;">.</span><span style="color:#f07178;">as_mut_ptr</span><span>()</span><span style="color:#f29668;">.</span><span style="color:#f07178;">byte_add</span><span>(</span><span style="color:#f29718;">U16_SIZE</span><span>) </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">*mut </span><span style="color:#f29668;">_</span><span style="color:#bfbab0cc;">,
+</span><span>                    len </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">u32</span><span style="color:#bfbab0cc;">,
+</span><span>                ) {
+</span><span>                    </span><span style="color:#f29718;">0 </span><span style="color:#f29668;">=&gt;</span><span> event</span><span style="color:#f29668;">.</span><span style="color:#f07178;">submit</span><span>(</span><span style="color:#f29718;">0</span><span>)</span><span style="color:#bfbab0cc;">,
+</span><span>                    </span><span style="color:#f29668;">_ =&gt;</span><span> event</span><span style="color:#f29668;">.</span><span style="color:#f07178;">discard</span><span>(</span><span style="color:#f29718;">0</span><span>)</span><span style="color:#bfbab0cc;">,
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>        </span><span style="font-style:italic;color:#39bae6;">None </span><span style="color:#f29668;">=&gt; </span><span>{
+</span><span>            </span><span style="color:#f07178;">info!</span><span>(</span><span style="color:#f29668;">&amp;</span><span>ctx</span><span style="color:#bfbab0cc;">, </span><span style="color:#c2d94c;">&quot;Cannot reserve space in ring buffer.&quot;</span><span>)</span><span style="color:#bfbab0cc;">;
+</span><span>        }
+</span><span>    }</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>The following schema represents each event reserved to the ring buffer.</p>
+<img src="/img/ringbuf-event.svg" width="800px">
+<h2 id="user-space-code">User-space code</h2>
+<p>In the userspace program, we can retrieve events from our ring buffer map. Each event contains the packet size and the raw packet data. To save packets in a pcap file, we'll use the <code>pcap-file-tokio</code> library, which leverages Tokio for asynchronous operations.</p>
+<p>We'll also need a buffered writer to avoid making a <code>write</code> syscall for each packet, as syscalls can be slow. Without this, the ring buffer might fill up faster than our userspace program can process events, causing it to run out of space.</p>
+<p>The following code is executed after loading the XDP program from userspace. We first need to get the map so we can access events.</p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span>    </span><span style="color:#ff7733;">let</span><span> ring_dump </span><span style="color:#f29668;">= </span><span>aya</span><span style="color:#f29668;">::</span><span>maps</span><span style="color:#f29668;">::</span><span>RingBuf</span><span style="color:#f29668;">::</span><span>try_from(bpf</span><span style="color:#f29668;">.</span><span style="color:#f07178;">take_map</span><span>(</span><span style="color:#c2d94c;">&quot;RING_BUF&quot;</span><span>)</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>())</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>We create a pcap file and pass it to the buffered writer, using the file name provided as an argument.</p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span>    </span><span style="color:#ff7733;">let</span><span> file_out </span><span style="color:#f29668;">= </span><span>File</span><span style="color:#f29668;">::</span><span>create(opt</span><span style="color:#f29668;">.</span><span>pcap_out</span><span style="color:#f29668;">.</span><span style="color:#f07178;">as_str</span><span>())
+</span><span>        </span><span style="color:#f29668;">.</span><span>await
+</span><span>        </span><span style="color:#f29668;">.</span><span style="color:#f07178;">expect</span><span>(</span><span style="color:#c2d94c;">&quot;Error creating file out&quot;</span><span>)</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>    </span><span style="font-style:italic;color:#5c6773;">// BufWriter to avoid a syscall per write. BufWriter will manage that for us and reduce the amound of syscalls.
+</span><span>    </span><span style="color:#ff7733;">let</span><span> stream </span><span style="color:#f29668;">= </span><span>BufWriter</span><span style="color:#f29668;">::</span><span>with_capacity(</span><span style="color:#f29718;">8192</span><span style="color:#bfbab0cc;">,</span><span> file_out)</span><span style="color:#bfbab0cc;">;
+</span><span>    </span><span style="color:#ff7733;">let mut</span><span> pcap_writer </span><span style="color:#f29668;">= </span><span>PcapWriter</span><span style="color:#f29668;">::</span><span>new(stream)</span><span style="color:#f29668;">.</span><span>await</span><span style="color:#f29668;">.</span><span style="color:#f07178;">expect</span><span>(</span><span style="color:#c2d94c;">&quot;Error writing file&quot;</span><span>)</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>We use Tokio to create a watch channel that signals the task for a graceful shutdown, allowing us to flush the file buffer before program termination. Without flushing the buffer, any packets still in the buffer won't be written to the pcap file, resulting in data loss.</p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span>    </span><span style="color:#ff7733;">let </span><span>(tx</span><span style="color:#bfbab0cc;">,</span><span> rx) </span><span style="color:#f29668;">= </span><span>watch</span><span style="color:#f29668;">::</span><span>channel(</span><span style="color:#f29718;">false</span><span>)</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>We then spawn a Tokio task to fetch events, write them into the buffer, and flush it upon program termination.</p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span>    </span><span style="color:#ff7733;">let</span><span> pcapdump_task </span><span style="color:#f29668;">= </span><span>tokio</span><span style="color:#f29668;">::</span><span>spawn(async </span><span style="color:#ff7733;">move </span><span>{
+</span><span>        </span><span style="color:#ff7733;">let mut</span><span> rx </span><span style="color:#f29668;">=</span><span> rx</span><span style="color:#f29668;">.</span><span style="color:#f07178;">clone</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>        </span><span style="color:#ff7733;">let mut</span><span> async_fd </span><span style="color:#f29668;">= </span><span>AsyncFd</span><span style="color:#f29668;">::</span><span>new(ring_dump)</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>        </span><span style="color:#ff7733;">loop </span><span>{
+</span><span>            tokio</span><span style="color:#f29668;">::</span><span>select</span><span style="color:#f29668;">! </span><span>{
+</span><span>                </span><span style="color:#f29668;">_ =</span><span> async_fd</span><span style="color:#f29668;">.</span><span style="color:#f07178;">readable_mut</span><span>() </span><span style="color:#f29668;">=&gt; </span><span>{
+</span><span>                    </span><span style="font-style:italic;color:#5c6773;">// Ready to read
+</span><span>                    </span><span style="color:#ff7733;">let mut</span><span> guard </span><span style="color:#f29668;">=</span><span> async_fd</span><span style="color:#f29668;">.</span><span style="color:#f07178;">readable_mut</span><span>()</span><span style="color:#f29668;">.</span><span>await</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>                    </span><span style="color:#ff7733;">let</span><span> rb </span><span style="color:#f29668;">=</span><span> guard</span><span style="color:#f29668;">.</span><span style="color:#f07178;">get_inner_mut</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>                    </span><span style="color:#ff7733;">while let </span><span style="font-style:italic;color:#39bae6;">Some</span><span>(read) </span><span style="color:#f29668;">=</span><span> rb</span><span style="color:#f29668;">.</span><span style="color:#f07178;">next</span><span>() {
+</span><span>                        </span><span style="color:#ff7733;">let</span><span> ptr </span><span style="color:#f29668;">=</span><span> read</span><span style="color:#f29668;">.</span><span style="color:#f07178;">as_ptr</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>                        </span><span style="font-style:italic;color:#5c6773;">// Retrieve packet len first then packet data
+</span><span>                        </span><span style="color:#ff7733;">let</span><span> size </span><span style="color:#f29668;">= </span><span style="color:#ff7733;">unsafe </span><span>{ ptr</span><span style="color:#f29668;">::</span><span>read_unaligned</span><span style="color:#f29668;">::</span><span>&lt;</span><span style="color:#ff7733;">u16</span><span>&gt;(ptr </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">*const u16</span><span>) }</span><span style="color:#bfbab0cc;">;
+</span><span>                        </span><span style="color:#ff7733;">let</span><span> data </span><span style="color:#f29668;">= </span><span style="color:#ff7733;">unsafe </span><span>{ slice</span><span style="color:#f29668;">::</span><span>from_raw_parts(ptr</span><span style="color:#f29668;">.</span><span style="color:#f07178;">byte_add</span><span>(</span><span style="color:#f29718;">2</span><span>)</span><span style="color:#bfbab0cc;">,</span><span> size</span><span style="color:#f29668;">.</span><span style="color:#f07178;">into</span><span>()) }</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>                        </span><span style="color:#ff7733;">let</span><span> ts </span><span style="color:#f29668;">= </span><span>SystemTime</span><span style="color:#f29668;">::</span><span>now()</span><span style="color:#f29668;">.</span><span style="color:#f07178;">duration_since</span><span>(</span><span style="color:#f29718;">UNIX_EPOCH</span><span>)</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>                        </span><span style="font-style:italic;color:#5c6773;">// Write to pcap file
+</span><span>                        </span><span style="color:#ff7733;">let</span><span> packet </span><span style="color:#f29668;">= </span><span>PcapPacket</span><span style="color:#f29668;">::</span><span>new(ts</span><span style="color:#bfbab0cc;">,</span><span> size </span><span style="color:#f29668;">as </span><span style="color:#ff7733;">u32</span><span style="color:#bfbab0cc;">,</span><span> data)</span><span style="color:#bfbab0cc;">;
+</span><span>                        pcap_writer</span><span style="color:#f29668;">.</span><span style="color:#f07178;">write_packet</span><span>(</span><span style="color:#f29668;">&amp;</span><span>packet)</span><span style="color:#f29668;">.</span><span>await</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>                    }
+</span><span>
+</span><span>                    guard</span><span style="color:#f29668;">.</span><span style="color:#f07178;">clear_ready</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>                }</span><span style="color:#bfbab0cc;">,
+</span><span>                </span><span style="color:#f29668;">_ =</span><span> rx</span><span style="color:#f29668;">.</span><span style="color:#f07178;">changed</span><span>() </span><span style="color:#f29668;">=&gt; </span><span>{
+</span><span>                    </span><span style="font-style:italic;color:#5c6773;">// Termination signal received
+</span><span>                    </span><span style="color:#ff7733;">if </span><span style="color:#f29668;">*</span><span>rx</span><span style="color:#f29668;">.</span><span style="color:#f07178;">borrow</span><span>() {
+</span><span>                        </span><span style="color:#ff7733;">break</span><span style="color:#bfbab0cc;">;
+</span><span>                    }
+</span><span>                }
+</span><span>            }
+</span><span>        }
+</span><span>
+</span><span>        </span><span style="font-style:italic;color:#5c6773;">// End of program, flush the buffer
+</span><span>        </span><span style="color:#ff7733;">let mut</span><span> buf_writer </span><span style="color:#f29668;">=</span><span> pcap_writer</span><span style="color:#f29668;">.</span><span style="color:#f07178;">into_writer</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>        buf_writer</span><span style="color:#f29668;">.</span><span style="color:#f07178;">flush</span><span>()</span><span style="color:#f29668;">.</span><span>await</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>    })</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>After awaiting the CTRL+C signal, we signal the task to stop and wait for it to complete.</p>
+<pre data-lang="rust" style="background-color:#0f1419;color:#bfbab0;" class="language-rust "><code class="language-rust" data-lang="rust"><span>    </span><span style="color:#f07178;">info!</span><span>(</span><span style="color:#c2d94c;">&quot;Waiting for Ctrl-C...&quot;</span><span>)</span><span style="color:#bfbab0cc;">;
+</span><span>    signal</span><span style="color:#f29668;">::</span><span>ctrl_c()</span><span style="color:#f29668;">.</span><span>await</span><span style="color:#f29668;">?</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>    </span><span style="font-style:italic;color:#5c6773;">// Signal the task to stop
+</span><span>    tx</span><span style="color:#f29668;">.</span><span style="color:#f07178;">send</span><span>(</span><span style="color:#f29718;">true</span><span>)</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>    </span><span style="font-style:italic;color:#5c6773;">// wait for the task to finish
+</span><span>    pcapdump_task</span><span style="color:#f29668;">.</span><span>await</span><span style="color:#f29668;">.</span><span style="color:#f07178;">unwrap</span><span>()</span><span style="color:#bfbab0cc;">;
+</span><span>
+</span><span>    </span><span style="color:#f07178;">info!</span><span>(</span><span style="color:#c2d94c;">&quot;Exiting...&quot;</span><span>)</span><span style="color:#bfbab0cc;">;
+</span></code></pre>
+<p>To test it, we'll assume our XDP program filters UDP packets originating from port 53 (DNS responses).
+Let's run our program by passing the name of the file we want to save packets in.</p>
+<pre data-lang="bash" style="background-color:#0f1419;color:#bfbab0;" class="language-bash "><code class="language-bash" data-lang="bash"><span style="color:#ffb454;">vagrant@ebpf-dev:</span><span style="font-style:italic;color:#39bae6;">~</span><span style="color:#ffb454;">/xdpdump-rs$</span><span> RUST_LOG=debug cargo xtask run</span><span style="color:#f29668;"> --</span><span> filtered.pcap
+</span><span style="color:#ffb454;">...
+</span><span style="color:#ffb454;">[2024-07-06T04:16:47Z</span><span> INFO  xdpdump_rs] Waiting for Ctrl-C...
+</span></code></pre>
+<p>We can use the command line <code>dig</code> to perform a DNS request to our favorite DNS servers.
+As shown below, we are getting timeouts from the DNS server.</p>
+<pre data-lang="bash" style="background-color:#0f1419;color:#bfbab0;" class="language-bash "><code class="language-bash" data-lang="bash"><span style="color:#ffb454;">vagrant@ebpf-dev:</span><span style="font-style:italic;color:#39bae6;">~</span><span style="color:#ffb454;">$</span><span> dig @8.8.8.8 reitw.fr
+</span><span>;</span><span style="color:#f29668;">; </span><span style="color:#ffb454;">communications</span><span> error to 8.8.8.8#53: timed out
+</span><span>;</span><span style="color:#f29668;">; </span><span style="color:#ffb454;">communications</span><span> error to 8.8.8.8#53: timed out
+</span><span>;</span><span style="color:#f29668;">; </span><span style="color:#ffb454;">communications</span><span> error to 8.8.8.8#53: timed out
+</span><span>
+</span><span style="color:#f29668;">; &lt;&lt;&gt;&gt;</span><span> DiG </span><span style="color:#ffb454;">9.18.24-1-Debian </span><span style="color:#f29668;">&lt;&lt;&gt;&gt;</span><span> @8.8.8.8 reitw.fr
+</span><span style="color:#f29668;">; </span><span>(</span><span style="color:#ffb454;">1</span><span> server found)
+</span><span>;</span><span style="color:#f29668;">; </span><span style="color:#ffb454;">global</span><span> options: +cmd
+</span><span>;</span><span style="color:#f29668;">; </span><span style="color:#ffb454;">no</span><span> servers could be reached
+</span></code></pre>
+<p>As shown below, we successfully dropped three responses originating from Google's DNS servers.</p>
+<pre data-lang="bash" style="background-color:#0f1419;color:#bfbab0;" class="language-bash "><code class="language-bash" data-lang="bash"><span style="color:#ffb454;">[2024-07-06T04:17:05Z</span><span> DEBUG xdpdump_rs] Dropping packet from source 8.8.8.8
+</span><span style="color:#ffb454;">[2024-07-06T04:17:10Z</span><span> DEBUG xdpdump_rs] Dropping packet from source 8.8.8.8
+</span><span style="color:#ffb454;">[2024-07-06T04:17:15Z</span><span> DEBUG xdpdump_rs] Dropping packet from source 8.8.8.8
+</span></code></pre>
+<p>Now, let's examine the PCAP file with tcpdump. As shown below, we can see three packets containing <code>A</code> responses for the domain <code>reitw.fr</code>.</p>
+<pre style="background-color:#0f1419;color:#bfbab0;"><code><span>vagrant@ebpf-dev:~/xdpdump-rs$ tcpdump -vvn -r filtered.pcap
+</span><span>reading from file filtered.pcap, link-type EN10MB (Ethernet), snapshot length 65535
+</span><span>04:17:05.215430 IP (tos 0x0, ttl 64, id 62244, offset 0, flags [none], proto UDP (17), length 129)
+</span><span>    8.8.8.8.53 &gt; 10.0.2.15.40736: [udp sum ok] 47092 q: A? reitw.fr. 4/0/1 reitw.fr. A 185.199.111.153, reitw.fr. A 185.199.108.153, reitw.fr. A 185.199.110.153, reitw.fr. A 185.199.109.153 ar: . OPT UDPsize=512 (101)
+</span><span>04:17:10.247388 IP (tos 0x0, ttl 64, id 62251, offset 0, flags [none], proto UDP (17), length 129)
+</span><span>    8.8.8.8.53 &gt; 10.0.2.15.53953: [udp sum ok] 47092 q: A? reitw.fr. 4/0/1 reitw.fr. A 185.199.110.153, reitw.fr. A 185.199.108.153, reitw.fr. A 185.199.109.153, reitw.fr. A 185.199.111.153 ar: . OPT UDPsize=512 (101)
+</span><span>04:17:15.268431 IP (tos 0x0, ttl 64, id 62258, offset 0, flags [none], proto UDP (17), length 129)
+</span><span>    8.8.8.8.53 &gt; 10.0.2.15.51077: [udp sum ok] 47092 q: A? reitw.fr. 4/0/1 reitw.fr. A 185.199.111.153, reitw.fr. A 185.199.108.153, reitw.fr. A 185.199.109.153, reitw.fr. A 185.199.110.153 ar: . OPT UDPsize=512 (101)
+</span></code></pre>
+<p>That's it. You can find the full code at this <a href="https://github.com/Rei-Tw/aya-xdpdump">link</a>.
+The code is experimental and can be enhanced for improved performance and readability.</p>
+
+</div>
+
+
+      </div>
+    </div>
+  </body>
+</html>
